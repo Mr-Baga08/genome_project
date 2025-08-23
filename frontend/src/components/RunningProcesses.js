@@ -1,15 +1,16 @@
-// frontend/src/components/RunningProcesses.js
 import React, { useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { BsCircle, BsCheckCircle, BsXCircle, BsClock } from 'react-icons/bs';
 
 const RunningProcesses = () => {
   const { state, actions } = useAppContext();
-  const { tasks, isLoading } = state;
+  const { tasks = [], isLoading } = state; // Ensure tasks is always an array
 
   useEffect(() => {
     // Load tasks when component mounts
-    actions.loadTasks();
+    if (actions.loadTasks) {
+      actions.loadTasks();
+    }
   }, []);
 
   const getStatusIcon = (status) => {
@@ -38,15 +39,21 @@ const RunningProcesses = () => {
   };
 
   const getElapsedTime = (task) => {
+    // Safely handle timestamp conversion
     if (!task.timestamps?.created) return 'Unknown';
     
-    const created = new Date(task.timestamps.created);
-    const now = new Date();
-    const elapsed = Math.floor((now - created) / 1000);
-    
-    if (elapsed < 60) return `${elapsed}s`;
-    if (elapsed < 3600) return `${Math.floor(elapsed / 60)}m`;
-    return `${Math.floor(elapsed / 3600)}h`;
+    try {
+      const created = new Date(task.timestamps.created);
+      const now = new Date();
+      const elapsed = Math.floor((now - created) / 1000);
+      
+      if (elapsed < 60) return `${elapsed}s`;
+      if (elapsed < 3600) return `${Math.floor(elapsed / 60)}m`;
+      return `${Math.floor(elapsed / 3600)}h`;
+    } catch (error) {
+      console.error('Error calculating elapsed time:', error);
+      return 'Unknown';
+    }
   };
 
   if (isLoading) {
@@ -60,9 +67,10 @@ const RunningProcesses = () => {
     );
   }
 
-  const activeTasks = tasks.filter(task => 
-    task.status === 'running' || task.status === 'queued'
-  );
+  // Filter active tasks safely
+  const activeTasks = Array.isArray(tasks) ? tasks.filter(task => 
+    task && (task.status === 'running' || task.status === 'queued')
+  ) : [];
 
   if (activeTasks.length === 0) {
     return (
@@ -75,41 +83,48 @@ const RunningProcesses = () => {
 
   return (
     <div className="processes-container">
-      {activeTasks.map((task) => (
-        <div key={task.task_id} className="card border-0 bg-white mb-2 shadow-sm">
-          <div className="card-body p-2">
-            <div className="d-flex justify-content-between align-items-center mb-1">
-              <div className="d-flex align-items-center">
-                {getStatusIcon(task.status)}
-                <span className="ms-2 small fw-medium">
-                  {task.task_id.substring(0, 8)}...
-                </span>
+      {activeTasks.map((task) => {
+        // Safely extract task properties
+        const taskId = task.task_id || 'unknown';
+        const status = task.status || 'unknown';
+        const nodeCount = task.workflow_definition?.nodes?.length || 0;
+        
+        return (
+          <div key={taskId} className="card border-0 bg-white mb-2 shadow-sm">
+            <div className="card-body p-2">
+              <div className="d-flex justify-content-between align-items-center mb-1">
+                <div className="d-flex align-items-center">
+                  {getStatusIcon(status)}
+                  <span className="ms-2 small fw-medium">
+                    {taskId.length > 8 ? `${taskId.substring(0, 8)}...` : taskId}
+                  </span>
+                </div>
+                <span className="small text-muted">{getElapsedTime(task)}</span>
               </div>
-              <span className="small text-muted">{getElapsedTime(task)}</span>
-            </div>
-            
-            <div className="progress" style={{ height: '4px' }}>
-              <div
-                className={`progress-bar bg-${getStatusColor(task.status)}`}
-                style={{ 
-                  width: task.status === 'running' ? '75%' : 
-                        task.status === 'completed' ? '100%' : '25%',
-                  transition: 'width 0.3s ease'
-                }}
-              />
-            </div>
-            
-            <div className="d-flex justify-content-between align-items-center mt-1">
-              <span className={`badge bg-${getStatusColor(task.status)} fs-6`}>
-                {task.status.toUpperCase()}
-              </span>
-              <small className="text-muted">
-                {task.workflow_definition?.nodes?.length || 0} nodes
-              </small>
+              
+              <div className="progress" style={{ height: '4px' }}>
+                <div
+                  className={`progress-bar bg-${getStatusColor(status)}`}
+                  style={{ 
+                    width: status === 'running' ? '75%' : 
+                          status === 'completed' ? '100%' : '25%',
+                    transition: 'width 0.3s ease'
+                  }}
+                />
+              </div>
+              
+              <div className="d-flex justify-content-between align-items-center mt-1">
+                <span className={`badge bg-${getStatusColor(status)} fs-6`}>
+                  {String(status).toUpperCase()}
+                </span>
+                <small className="text-muted">
+                  {nodeCount} nodes
+                </small>
+              </div>
             </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 };

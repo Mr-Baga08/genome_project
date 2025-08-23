@@ -12,7 +12,11 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Copy and install Python requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# MODIFIED: Force reinstall motor to ensure compatible pymongo version is installed
+RUN pip install --no-cache-dir -r requirements.txt && pip install --upgrade --force-reinstall motor
+
+# --- NEW: Create a tarball of the virtual environment ---
+RUN tar -czf /tmp/venv.tar.gz -C /opt venv
 
 
 # --- Stage 2: Final Image ---
@@ -22,14 +26,16 @@ FROM python:3.9-slim
 WORKDIR /app
 
 # Install only necessary runtime dependencies
-# We install 'docker-cli' to interact with the Docker socket, NOT the full daemon
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the virtual environment from the builder stage
-COPY --from=builder /opt/venv /opt/venv
+# --- MODIFIED: Copy the single tarball instead of the whole directory ---
+COPY --from=builder /tmp/venv.tar.gz /tmp/venv.tar.gz
+
+# --- NEW: Unpack the virtual environment ---
+RUN tar -xzf /tmp/venv.tar.gz -C /opt && rm /tmp/venv.tar.gz
 
 # Activate the virtual environment
 ENV PATH="/opt/venv/bin:$PATH"
@@ -38,11 +44,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY . .
 
 # Create necessary directories
-# Note: These are also managed by volumes in docker-compose, which is good practice
 RUN mkdir -p /app/uploads /tmp/ugene_workdir
 
 # Expose port
 EXPOSE 8000
 
-# Production-ready start command (NO --reload)
+# Production-ready start command
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

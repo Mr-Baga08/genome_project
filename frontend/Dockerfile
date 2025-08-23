@@ -18,16 +18,20 @@ ENV REACT_APP_API_URL=$REACT_APP_API_URL
 
 RUN npm run build
 
-# Production stage
-FROM nginx:alpine
+# Start in development mode instead of building
+EXPOSE 3000
+CMD ["npm", "start"]
 
-# Copy built application
-COPY --from=build /app/build /usr/share/nginx/html
+# # Production stage
+# FROM nginx:alpine
 
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/nginx.conf
+# # Copy built application
+# COPY --from=build /app/build /usr/share/nginx/html
 
-# Expose port 80
-EXPOSE 80
+# # Copy nginx configuration
+# COPY nginx.conf /etc/nginx/nginx.conf
 
-CMD ["nginx", "-g", "daemon off;"]
+# # Expose port 80
+# EXPOSE 80
+
+# CMD ["nginx", "-g", "daemon off;"]
