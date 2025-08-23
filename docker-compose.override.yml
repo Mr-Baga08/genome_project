@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  backend:
+    # Re-introduce the volume mount for live code changes
+    volumes:
+      - ./backend:/app
+    # Override the CMD to re-enable --reload for development
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    # Re-introduce the volume mount so the worker also sees code changes
+    volumes:
+      - ./backend:/app
