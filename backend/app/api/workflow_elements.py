@@ -1,76 +1,216 @@
-# backend/app/api/workflow_elements.py - New API endpoint
-from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Dict, Any
-from ..utils.ugene_commands import UgeneCommandBuilder
+# backend/app/api/workflow_elements.py
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, BackgroundTasks
+from typing import List, Dict, Any, Optional
+from ..services.data_readers import DataReaderService
+from ..services.analysis_tools import AnalysisToolsService
+from ..services.workflow_engine import WorkflowEngine
+from ..models.enhanced_models import *
+from ..database.database_setup import DatabaseManager
 
 router = APIRouter()
 
-@router.get("/elements", response_model=Dict[str, Any])
-async def get_supported_elements():
-    """Get all supported workflow elements and their capabilities"""
-    builder = UgeneCommandBuilder()
-    
-    supported_elements = {}
-    for element_name in builder.get_supported_elements():
-        element_info = builder.get_element_info(element_name)
-        supported_elements[element_name] = element_info
-    
-    return {
-        "supported_elements": supported_elements,
-        "total_count": len(supported_elements),
-        "categories": _group_elements_by_category(supported_elements)
-    }
+# Initialize services (these would be dependency injected in production)
+data_reader = DataReaderService()
+analysis_tools = AnalysisToolsService()
 
-@router.post("/elements/validate")
-async def validate_workflow_elements(workflow: Dict[str, Any]):
-    """Validate a workflow against supported elements"""
-    builder = UgeneCommandBuilder()
-    validation_result = builder.validate_workflow(workflow)
+# Workflow Elements Endpoints
+@router.get("/workflow/elements")
+async def get_workflow_elements():
+    """Get all available workflow elements organized by category"""
     
-    return validation_result
-
-@router.get("/elements/{element_name}")
-async def get_element_details(element_name: str):
-    """Get detailed information about a specific element"""
-    builder = UgeneCommandBuilder()
-    
-    if not builder.is_element_supported(element_name):
-        raise HTTPException(status_code=404, detail=f"Element '{element_name}' not found")
-    
-    element_info = builder.get_element_info(element_name)
-    return {
-        "name": element_name,
-        "details": element_info,
-        "supported": True
+    elements = {
+        "Data Readers": [
+            {
+                "name": "read_alignment",
+                "display_name": "Read Alignment",
+                "description": "Read alignment files (FASTA, Clustal, Stockholm)",
+                "input_ports": [],
+                "output_ports": ["sequences"],
+                "parameters": {
+                    "format_type": {"type": "select", "options": ["fasta", "clustal", "stockholm"], "default": "fasta"}
+                }
+            },
+            {
+                "name": "read_annotations", 
+                "display_name": "Read Annotations",
+                "description": "Read annotation files (GFF3, GTF, BED)",
+                "input_ports": [],
+                "output_ports": ["annotations"],
+                "parameters": {
+                    "format_type": {"type": "select", "options": ["gff3", "gtf", "bed"], "default": "gff3"}
+                }
+            },
+            {
+                "name": "read_fastq_se",
+                "display_name": "Read FASTQ SE",
+                "description": "Read single-end FASTQ files",
+                "input_ports": [],
+                "output_ports": ["reads"],
+                "parameters": {}
+            },
+            {
+                "name": "read_fastq_pe",
+                "display_name": "Read FASTQ PE", 
+                "description": "Read paired-end FASTQ files",
+                "input_ports": [],
+                "output_ports": ["paired_reads"],
+                "parameters": {}
+            },
+            {
+                "name": "read_file_urls",
+                "display_name": "Read File URLs",
+                "description": "Read files from remote URLs",
+                "input_ports": [],
+                "output_ports": ["files"],
+                "parameters": {
+                    "urls": {"type": "text_array", "description": "List of URLs to fetch"}
+                }
+            },
+            {
+                "name": "read_sequence_remote",
+                "display_name": "Read Sequence Remote",
+                "description": "Fetch sequences from remote databases (NCBI, UniProt)",
+                "input_ports": [],
+                "output_ports": ["sequences"],
+                "parameters": {
+                    "accession": {"type": "text", "description": "Accession number"},
+                    "database": {"type": "select", "options": ["ncbi", "uniprot"], "default": "ncbi"}
+                }
+            }
+        ],
+        
+        "Data Writers": [
+            {
+                "name": "write_alignment",
+                "display_name": "Write Alignment",
+                "description": "Write sequences to alignment formats",
+                "input_ports": ["sequences"],
+                "output_ports": ["file"],
+                "parameters": {
+                    "format_type": {"type": "select", "options": ["fasta", "clustal", "phylip"], "default": "fasta"}
+                }
+            },
+            {
+                "name": "write_fasta",
+                "display_name": "Write FASTA", 
+                "description": "Write sequences in FASTA format",
+                "input_ports": ["sequences"],
+                "output_ports": ["file"],
+                "parameters": {}
+            },
+            {
+                "name": "write_annotations",
+                "display_name": "Write Annotations",
+                "description": "Write annotations to various formats",
+                "input_ports": ["annotations"], 
+                "output_ports": ["file"],
+                "parameters": {
+                    "format_type": {"type": "select", "options": ["gff3", "gtf", "bed"], "default": "gff3"}
+                }
+            }
+        ],
+        
+        "Analysis Tools": [
+            {
+                "name": "blast_search",
+                "display_name": "BLAST Search",
+                "description": "Perform BLAST sequence similarity search",
+                "input_ports": ["sequences"],
+                "output_ports": ["results"],
+                "parameters": {
+                    "database": {"type": "select", "options": ["nr", "nt", "swissprot"], "default": "nr"},
+                    "evalue": {"type": "float", "default": 1e-5},
+                    "max_hits": {"type": "integer", "default": 10}
+                }
+            },
+            {
+                "name": "multiple_alignment",
+                "display_name": "Multiple Alignment",
+                "description": "Perform multiple sequence alignment",
+                "input_ports": ["sequences"],
+                "output_ports": ["alignment"],
+                "parameters": {
+                    "method": {"type": "select", "options": ["muscle", "clustalw", "mafft"], "default": "muscle"}
+                }
+            },
+            {
+                "name": "statistics",
+                "display_name": "Statistics",
+                "description": "Calculate sequence statistics",
+                "input_ports": ["sequences"],
+                "output_ports": ["statistics"],
+                "parameters": {}
+            }
+        ],
+        
+        "Data Flow": [
+            {
+                "name": "filter_sequences",
+                "display_name": "Filter Sequences",
+                "description": "Filter sequences based on criteria",
+                "input_ports": ["sequences"],
+                "output_ports": ["filtered_sequences"],
+                "parameters": {
+                    "min_length": {"type": "integer", "default": 0},
+                    "max_length": {"type": "integer", "default": 10000},
+                    "min_gc": {"type": "float", "default": 0},
+                    "max_gc": {"type": "float", "default": 100}
+                }
+            }
+        ]
     }
+    
+    return elements
 
-def _group_elements_by_category(elements: Dict[str, Any]) -> Dict[str, List[str]]:
-    """Group elements by category based on their names"""
-    categories = {
-        "Data Readers": [],
-        "Data Writers": [],
-        "Alignment Tools": [],
-        "Analysis Tools": [],
-        "Data Converters": [],
-        "NGS Tools": [],
-        "Other": []
-    }
-    
-    for element_name in elements.keys():
-        if "Read" in element_name:
-            categories["Data Readers"].append(element_name)
-        elif "Write" in element_name:
-            categories["Data Writers"].append(element_name)
-        elif "Align" in element_name:
-            categories["Alignment Tools"].append(element_name)
-        elif any(term in element_name for term in ["Statistics", "Summarize", "DESeq2", "Kallisto"]):
-            categories["Analysis Tools"].append(element_name)
-        elif any(term in element_name for term in ["Convert", "Parser"]):
-            categories["Data Converters"].append(element_name)
-        elif "NGS" in element_name or any(term in element_name for term in ["Splitter", "Merger"]):
-            categories["NGS Tools"].append(element_name)
-        else:
-            categories["Other"].append(element_name)
-    
-    # Remove empty categories
-    return {k: v for k, v in categories.items() if v}
+
+# Data Reader Endpoints
+@router.post("/readers/alignment")
+async def read_alignment_endpoint(file: UploadFile = File(...), format_type: str = "fasta"):
+    content = await file.read()
+    return await data_reader.read_alignment(content.decode('utf-8'), format_type)
+
+@router.post("/readers/annotations") 
+async def read_annotations_endpoint(file: UploadFile = File(...), format_type: str = "gff3"):
+    content = await file.read()
+    return await data_reader.read_annotations(content.decode('utf-8'), format_type)
+
+@router.post("/readers/fastq-se")
+async def read_fastq_se_endpoint(file: UploadFile = File(...)):
+    content = await file.read()
+    return await data_reader.read_fastq_se_reads(content.decode('utf-8'))
+
+@router.post("/readers/fastq-pe")
+async def read_fastq_pe_endpoint(r1_file: UploadFile = File(...), r2_file: UploadFile = File(...)):
+    r1_content = await r1_file.read()
+    r2_content = await r2_file.read()
+    return await data_reader.read_fastq_pe_reads(
+        r1_content.decode('utf-8'),
+        r2_content.decode('utf-8')
+    )
+
+@router.post("/readers/file-urls")
+async def read_file_urls_endpoint(urls: List[str]):
+    return await data_reader.read_file_urls(urls)
+
+
+# Analysis Tool Endpoints
+@router.post("/analysis/blast")
+async def blast_search_endpoint(request: BlastSearchRequest):
+    return await analysis_tools.run_blast_search(
+        request.sequences,
+        request.database,
+        {
+            "evalue": str(request.evalue),
+            "max_hits": request.max_hits,
+            "word_size": request.word_size
+        }
+    )
+
+@router.post("/analysis/alignment")
+async def multiple_alignment_endpoint(request: MultipleAlignmentRequest):
+    sequences = [seq.dict() for seq in request.sequences]
+    return await analysis_tools.run_multiple_alignment(
+        sequences,
+        request.method,
+        request.parameters
+    )

@@ -629,7 +629,7 @@ const Genomics = () => {
       {/* <footer className="bg-white border-top">
         <FooterContent />
       </footer> */}
-
+ 
       {/* Notifications */}
       <div className="position-fixed bottom-0 end-0 p-3" style={{ zIndex: 1055 }}>
         {notifications.map(notification => (
