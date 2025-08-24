@@ -1,0 +1,55 @@
+# monitoring/prometheus.yml - Prometheus Configuration
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # API Gateway metrics
+  - job_name: 'api-gateway'
+    static_configs:
+      - targets: ['api-gateway:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # Microservices metrics
+  - job_name: 'sequence-service'
+    static_configs:
+      - targets: ['sequence-service:8001']
+    metrics_path: '/metrics'
+
+  - job_name: 'analysis-service'
+    static_configs:
+      - targets: ['analysis-service:8002']
+    metrics_path: '/metrics'
+
+  - job_name: 'workflow-service'
+    static_configs:
+      - targets: ['workflow-service:8003']
+    metrics_path: '/metrics'
+
+  # Infrastructure metrics
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+
+  # Node exporter for system metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']

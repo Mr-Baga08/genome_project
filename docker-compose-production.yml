@@ -1,0 +1,421 @@
+# docker-compose.production.yml - Enhanced production deployment
+version: '3.8'
+
+services:
+  # Load Balancer
+  nginx:
+    image: nginx:alpine
+    container_name: bioinformatics_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - static_files:/var/www/static
+    depends_on:
+      - api-gateway
+      - frontend
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.production
+    container_name: bioinformatics_api_gateway
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/bioinformatics_db
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - MAX_WORKERS=4
+      - WORKER_CLASS=uvicorn.workers.UvicornWorker
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - upload_storage:/app/uploads
+      - analysis_data:/app/data
+      - ./backend/logs:/app/logs
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Microservices
+  sequence-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.microservice
+      args:
+        SERVICE_NAME: sequence_service
+    container_name: bioinformatics_sequence_service
+    environment:
+      - SERVICE_NAME=sequence_service
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/sequences_db
+      - REDIS_URL=redis://redis:6379/1
+      - LOG_LEVEL=INFO
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sequence_data:/app/data
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  analysis-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.analysis
+    container_name: bioinformatics_analysis_service
+    environment:
+      - SERVICE_NAME=analysis_service
+      - CELERY_BROKER=redis://redis:6379/2
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/bioinformatics_db
+      - BLAST_DB_PATH=/data/blast_databases
+      - DIAMOND_PATH=/usr/local/bin/diamond
+      - MUSCLE_PATH=/usr/local/bin/muscle
+      - MAX_MEMORY=8G
+    volumes:
+      - blast_databases:/data/blast_databases
+      - analysis_temp:/tmp/analysis
+      - bioinformatics_tools:/usr/local/bin
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+
+  # Workflow Service
+  workflow-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.workflow
+    container_name: bioinformatics_workflow_service
+    environment:
+      - SERVICE_NAME=workflow_service
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/workflows_db
+      - REDIS_URL=redis://redis:6379/3
+      - SERVICE_REGISTRY_URL=http://consul:8500
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - workflow_data:/app/data
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+  # Celery Workers for Heavy Computation
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    environment:
+      - CELERY_BROKER=redis://redis:6379/2
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/bioinformatics_db
+      - WORKER_CONCURRENCY=4
+      - WORKER_MAX_TASKS_PER_CHILD=1000
+      - BLAST_DB_PATH=/data/blast_databases
+    volumes:
+      - blast_databases:/data/blast_databases
+      - analysis_temp:/tmp/analysis
+      - bioinformatics_tools:/usr/local/bin
+    depends_on:
+      - redis
+      - postgres
+      - analysis-service
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    deploy:
+      replicas: 6
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    command: celery -A app.worker worker --loglevel=info --concurrency=4
+
+  # Celery Beat Scheduler
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    environment:
+      - CELERY_BROKER=redis://redis:6379/2
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/bioinformatics_db
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    command: celery -A app.worker beat --loglevel=info
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.production
+      args:
+        REACT_APP_API_URL: ${API_URL}
+        REACT_APP_VERSION: ${VERSION}
+    container_name: bioinformatics_frontend
+    volumes:
+      - static_files:/app/build
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+  # PostgreSQL Cluster
+  postgres:
+    image: postgres:15
+    container_name: bioinformatics_postgres
+    environment:
+      - POSTGRES_DB=bioinformatics_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_MULTIPLE_DATABASES=sequences_db,workflows_db,annotations_db,analysis_db
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init-scripts:/docker-entrypoint-initdb.d
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+      - postgres_backups:/backups
+    ports:
+      - "5432:5432"
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis Cluster
+  redis:
+    image: redis:7-alpine
+    container_name: bioinformatics_redis
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    command: redis-server /etc/redis/redis.conf --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Service Discovery with Consul
+  consul:
+    image: consul:1.15
+    container_name: bioinformatics_consul
+    command: consul agent -dev -client=0.0.0.0 -ui
+    ports:
+      - "8500:8500"
+    volumes:
+      - consul_data:/consul/data
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+  # Monitoring - Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: bioinformatics_prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/rules:/etc/prometheus/rules
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=30d'
+
+  # Monitoring - Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: bioinformatics_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel,grafana-worldmap-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+  # Log Management - Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: bioinformatics_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # Log Management - Logstash
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.8.0
+    container_name: bioinformatics_logstash
+    volumes:
+      - ./logging/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+      - ./backend/logs:/app/logs:ro
+    depends_on:
+      - elasticsearch
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+  # Log Management - Kibana
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: bioinformatics_kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+  # Backup Service
+  backup-service:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    container_name: bioinformatics_backup
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - S3_BUCKET=${S3_BACKUP_BUCKET}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - BACKUP_SCHEDULE=0 2 * * *
+    volumes:
+      - postgres_backups:/backups
+      - backup_scripts:/scripts
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - bioinformatics-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  blast_databases:
+    driver: local
+  analysis_temp:
+    driver: local
+  bioinformatics_tools:
+    driver: local
+  upload_storage:
+    driver: local
+  static_files:
+    driver: local
+  sequence_data:
+    driver: local
+  workflow_data:
+    driver: local
+  analysis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  consul_data:
+    driver: local
+  postgres_backups:
+    driver: local
+  backup_scripts:
+    driver: local
+
+networks:
+  bioinformatics-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+
+# Health check and monitoring
+x-common-healthcheck: &common-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 40s

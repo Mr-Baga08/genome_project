@@ -1,0 +1,65 @@
+# backend/Dockerfile.production - Production Backend Dockerfile
+FROM python:3.11-slim as builder
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    wget \
+    unzip \
+    git \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install bioinformatics tools
+RUN wget http://eddylab.org/software/hmmer/hmmer.tar.gz \
+    && tar -xzf hmmer.tar.gz \
+    && cd hmmer-* \
+    && ./configure --prefix=/usr/local \
+    && make \
+    && make install \
+    && cd .. \
+    && rm -rf hmmer*
+
+RUN wget https://github.com/bbuchfink/diamond/releases/download/v2.1.8/diamond-linux64.tar.gz \
+    && tar -xzf diamond-linux64.tar.gz \
+    && mv diamond /usr/local/bin/ \
+    && chmod +x /usr/local/bin/diamond
+
+# Production stage
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy binaries from builder
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --gid 1001 --system app \
+    && adduser --no-create-home --shell /bin/false --disabled-password --uid 1001 --system --group app
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p /app/uploads /app/data /app/logs \
+    && chown -R app:app /app
+
+# Switch to non-root user
+USER app
+
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["gunicorn", "app.main:app", "--bind", "0.0.0.0:8000", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers", "4", "--max-requests", "1000", "--max-requests-jitter", "100", "--preload"]

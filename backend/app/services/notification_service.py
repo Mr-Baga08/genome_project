@@ -272,4 +272,3 @@ class NotificationService:
             notif for notif in self.notification_history
             if datetime.fromisoformat(notif['timestamp']) > cutoff_date
         ]
-

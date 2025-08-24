@@ -1,0 +1,14 @@
+aiofiles==24.1.0
+Bio==1.8.0
+core==1.0.1
+docker_py==1.10.6
+fastapi==0.116.1
+motor==3.7.1
+numpy==2.3.2
+pandas==2.3.2
+pydantic==2.11.7
+python_magic==0.4.27
+redis==6.4.0
+Requests==2.32.5
+rq==2.5.0
+websockets==15.0.1

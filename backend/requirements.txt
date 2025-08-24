@@ -1,16 +1,31 @@
+# --- Core Web Framework & Server ---
+fastapi
+pydantic
+uvicorn[standard]
+websockets
 
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+# --- Asynchronous Tasks & Caching ---
+celery
+redis
 
-redis==5.0.1
-rq==1.15.1
-pydantic==2.5.0
-python-multipart==0.0.6
-aiofiles==23.2.1
-pandas==2.1.3
-numpy==1.25.2
-scikit-learn==1.3.2
-umap-learn==0.5.4
-python-dotenv==1.0.0
-motor==2.5.1
-pymongo==3.12.3
+# --- Database (PostgreSQL) ---
+sqlalchemy
+psycopg2-binary
+
+# --- Bioinformatics & Data Handling ---
+biopython  # This is the correct package for 'import Bio'
+pandas
+numpy
+openpyxl
+aiofiles
+
+# --- External Communication & Services ---
+requests
+docker
+
+# --- Utility & File Handling ---
+python-magic
+
+# --- Security ---
+python-jose[cryptography]
+passlib[bcrypt]
