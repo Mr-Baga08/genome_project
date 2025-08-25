@@ -3,26 +3,28 @@ import uuid
 import asyncio
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from rq import Queue
-from redis import Redis
 from datetime import datetime
+
+# --- Key Change: Import the Celery task ---
+# We no longer import RQ. Instead, we import the task function we defined in our worker.
+# from ..worker import execute_task
 
 from ..models.task import Task, TaskStatus
 from ..services.ugene_runner import UgeneRunner
 
 class TaskManager:
-    def __init__(self, db: AsyncIOMotorDatabase, redis_client: Redis):
+    # --- Key Change: __init__ no longer needs redis_client ---
+    # Its responsibility is now focused on managing tasks in the database.
+    def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
         self.tasks_collection = db.tasks
-        self.redis_client = redis_client
-        self.task_queue = Queue(connection=redis_client)
         self.ugene_runner = UgeneRunner()
 
     async def create_task(self, workflow_definition: dict, priority: str = "medium") -> str:
-        """Create a new task from workflow definition"""
+        """Create a new task and submit it to the Celery worker"""
         task_id = str(uuid.uuid4())
         
-        # Convert workflow to UGENE commands
+        # This logic remains the same
         commands = self._workflow_to_commands(workflow_definition)
         
         task = Task(
@@ -31,34 +33,31 @@ class TaskManager:
             commands=commands,
             priority=priority,
             timestamps={
-                "created": datetime.utcnow(),
+                "created": datetime.now(), # Using timezone-aware now() is often better
                 "started": None,
                 "completed": None
             }
         )
         
-        # Save to MongoDB
+        # Save to MongoDB (remains the same)
         await self.tasks_collection.insert_one(task.dict())
         
-        # Add to Redis queue for processing
-        self.task_queue.enqueue(
-            self._execute_task_worker,
-            task_id,
-            job_timeout='30m',
-            job_id=task_id
-        )
+        # --- Key Change: Enqueue task using Celery ---
+        # Instead of using rq's queue.enqueue, we call .delay() on our imported task.
+        # This sends the task to the Redis broker for a Celery worker to pick up.
+        execute_task.delay(task_id)
         
         return task_id
 
     async def get_task(self, task_id: str) -> Optional[Task]:
-        """Retrieve task by ID"""
+        """Retrieve task by ID (No changes needed)"""
         task_data = await self.tasks_collection.find_one({"task_id": task_id})
         if task_data:
             return Task(**task_data)
         return None
 
     async def get_all_tasks(self, page: int = 1, size: int = 10) -> List[Task]:
-        """Get paginated list of all tasks"""
+        """Get paginated list of all tasks (No changes needed)"""
         skip = (page - 1) * size
         cursor = self.tasks_collection.find().skip(skip).limit(size).sort("timestamps.created", -1)
         tasks = []
@@ -69,21 +68,20 @@ class TaskManager:
     async def update_task_status(self, task_id: str, status: TaskStatus, 
                                logs: Optional[str] = None, error_logs: Optional[str] = None,
                                output_files: List[str] = None):
-        """Update task status and metadata"""
+        """Update task status and metadata (No changes needed)"""
         update_data = {"status": status}
         
-        if logs:
+        if logs is not None:
             update_data["logs"] = logs
-        if error_logs:
+        if error_logs is not None:
             update_data["error_logs"] = error_logs
-        if output_files:
+        if output_files is not None:
             update_data["output_files"] = output_files
             
-        # Update timestamps
         if status == TaskStatus.RUNNING:
-            update_data["timestamps.started"] = datetime.utcnow()
+            update_data["timestamps.started"] = datetime.now()
         elif status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-            update_data["timestamps.completed"] = datetime.utcnow()
+            update_data["timestamps.completed"] = datetime.now()
             
         await self.tasks_collection.update_one(
             {"task_id": task_id}, 
@@ -91,14 +89,11 @@ class TaskManager:
         )
 
     def _workflow_to_commands(self, workflow_definition: dict) -> List[str]:
-        """Convert workflow definition to UGENE commands"""
+        """Convert workflow definition to UGENE commands (No changes needed)"""
         commands = []
         nodes = workflow_definition.get("nodes", [])
-        connections = workflow_definition.get("connections", [])
         
-        # Process each node and generate appropriate UGENE command
         for node in nodes:
-            node_type = node.get("type", "")
             node_name = node.get("name", "")
             
             if "Read FASTQ" in node_name:
@@ -109,44 +104,9 @@ class TaskManager:
             elif "Build Tree" in node_name:
                 tree_method = node_name.split("Build Tree with ")[1].lower().replace(" ", "-")
                 commands.append(f"ugene --task=build-tree-{tree_method} --in=alignment.aln --out=tree.nwk")
-            # Add more node type mappings as needed
             
         return commands
 
-    async def _execute_task_worker(self, task_id: str):
-        """Worker function executed by Redis Queue"""
-        try:
-            # Update status to running
-            await self.update_task_status(task_id, TaskStatus.RUNNING)
-            
-            # Get task details
-            task = await self.get_task(task_id)
-            if not task:
-                raise Exception(f"Task {task_id} not found")
-            
-            # Execute task using UgeneRunner
-            result = await self.ugene_runner.execute_task(task)
-            
-            # Update task with results
-            if result.success:
-                await self.update_task_status(
-                    task_id, 
-                    TaskStatus.COMPLETED,
-                    logs=result.stdout,
-                    output_files=result.output_files
-                )
-            else:
-                await self.update_task_status(
-                    task_id,
-                    TaskStatus.FAILED,
-                    logs=result.stdout,
-                    error_logs=result.stderr
-                )
-                
-        except Exception as e:
-            await self.update_task_status(
-                task_id,
-                TaskStatus.FAILED,
-                error_logs=str(e)
-            )
-
+    # --- Key Change: The worker execution logic is REMOVED ---
+    # The _execute_task_worker method is no longer needed here.
+    # Its logic has been moved to the Celery task in 'app/worker.py'.

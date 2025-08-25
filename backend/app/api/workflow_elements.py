@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Backgro
 from typing import List, Dict, Any, Optional
 from ..services.data_readers import DataReaderService
 from ..services.analysis_tools import AnalysisToolsService
-from ..services.workflow_engine import workflowengine
+from ..services.workflow_engine import WorkflowEngine
 from ..models.enhanced_models import *
 from ..database.database_setup import DatabaseManager
 

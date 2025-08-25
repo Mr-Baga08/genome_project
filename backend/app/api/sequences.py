@@ -1,6 +1,9 @@
 # backend/app/api/sequences.py
+
 from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import List, Optional
+from typing import List, Optional, Dict, Any # FIXED: Added Dict and Any
+from datetime import datetime # FIXED: Added datetime import
+from bson import ObjectId # FIXED: Added ObjectId for querying
 from ..models.enhanced_models import SequenceData, Annotation
 from ..database.database_setup import DatabaseManager
 
@@ -13,7 +16,8 @@ async def create_sequence(sequence: SequenceData, db_manager: DatabaseManager = 
         sequences_collection = await db_manager.get_collection("sequences")
         
         # Insert sequence
-        result = await sequences_collection.insert_one(sequence.dict())
+        # FIXED: Changed .dict() to .model_dump() for Pydantic V2 compatibility
+        result = await sequences_collection.insert_one(sequence.model_dump())
         
         if result.inserted_id:
             # Return created sequence
@@ -59,7 +63,8 @@ async def get_sequence(sequence_id: str, db_manager: DatabaseManager = Depends()
     try:
         sequences_collection = await db_manager.get_collection("sequences")
         
-        sequence = await sequences_collection.find_one({"id": sequence_id})
+        # FIXED: Query by MongoDB's '_id' and convert string to ObjectId
+        sequence = await sequences_collection.find_one({"_id": ObjectId(sequence_id)})
         if not sequence:
             raise HTTPException(status_code=404, detail="Sequence not found")
         
@@ -83,16 +88,21 @@ async def update_sequence(
         # Add updated_at timestamp
         sequence_update["updated_at"] = datetime.utcnow()
         
+        # FIXED: Query by MongoDB's '_id' and convert string to ObjectId
         result = await sequences_collection.update_one(
-            {"id": sequence_id},
+            {"_id": ObjectId(sequence_id)},
             {"$set": sequence_update}
         )
         
         if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Sequence not found")
+            # It might not be found or the data might be the same.
+            # Check if it exists to return a proper 404.
+            check_exists = await sequences_collection.find_one({"_id": ObjectId(sequence_id)})
+            if not check_exists:
+                raise HTTPException(status_code=404, detail="Sequence not found")
         
         # Return updated sequence
-        updated_sequence = await sequences_collection.find_one({"id": sequence_id})
+        updated_sequence = await sequences_collection.find_one({"_id": ObjectId(sequence_id)})
         return SequenceData(**updated_sequence)
         
     except HTTPException:
@@ -100,13 +110,14 @@ async def update_sequence(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.delete("/sequences/{sequence_id}")
+@router.delete("/sequences/{sequence_id}", status_code=200) # FIXED: Return status 200 for clarity
 async def delete_sequence(sequence_id: str, db_manager: DatabaseManager = Depends()):
     """Delete a sequence"""
     try:
         sequences_collection = await db_manager.get_collection("sequences")
         
-        result = await sequences_collection.delete_one({"id": sequence_id})
+        # FIXED: Query by MongoDB's '_id' and convert string to ObjectId
+        result = await sequences_collection.delete_one({"_id": ObjectId(sequence_id)})
         
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Sequence not found")
@@ -131,7 +142,8 @@ async def add_annotation(
         # Set sequence_id
         annotation.sequence_id = sequence_id
         
-        result = await annotations_collection.insert_one(annotation.dict())
+        # FIXED: Changed .dict() to .model_dump() for Pydantic V2 compatibility
+        result = await annotations_collection.insert_one(annotation.model_dump())
         
         if result.inserted_id:
             created_annotation = await annotations_collection.find_one({"_id": result.inserted_id})

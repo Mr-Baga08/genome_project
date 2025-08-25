@@ -1,216 +1,505 @@
 # backend/app/websockets/connection_manager.py
-import json
 import asyncio
+import json
+import logging
 from typing import Dict, List, Set, Optional, Any
 from fastapi import WebSocket, WebSocketDisconnect
 from datetime import datetime
 import uuid
-import redis
-import logging
-from ..models.enhanced_models import TaskStatus
 
 logger = logging.getLogger(__name__)
 
 class ConnectionManager:
     """Manages WebSocket connections for real-time updates"""
     
-    def __init__(self, redis_url: str):
+    def __init__(self):
+        # Active connections: {connection_id: WebSocket}
         self.active_connections: Dict[str, WebSocket] = {}
-        self.user_connections: Dict[str, Set[str]] = {}  # user_id -> connection_ids
-        self.task_subscriptions: Dict[str, Set[str]] = {}  # task_id -> connection_ids
-        self.workflow_subscriptions: Dict[str, Set[str]] = {}  # workflow_id -> connection_ids
-        self.redis_client = redis.Redis.from_url(redis_url)
-        self.pubsub = self.redis_client.pubsub()
         
-        # Start Redis subscriber task
-        asyncio.create_task(self._redis_subscriber())
+        # Room subscriptions: {room_name: Set[connection_id]}
+        self.room_subscriptions: Dict[str, Set[str]] = {}
+        
+        # User connections: {user_id: Set[connection_id]}
+        self.user_connections: Dict[str, Set[str]] = {}
+        
+        # Connection metadata: {connection_id: metadata}
+        self.connection_metadata: Dict[str, Dict[str, Any]] = {}
+        
+        # Message history for replay: {room_name: List[messages]}
+        self.message_history: Dict[str, List[Dict[str, Any]]] = {}
+        
+        # Statistics
+        self.stats = {
+            "total_connections": 0,
+            "messages_sent": 0,
+            "rooms_created": 0,
+            "connection_errors": 0
+        }
     
-    async def connect(self, websocket: WebSocket, user_id: str = None) -> str:
-        """Accept WebSocket connection and return connection ID"""
+    async def connect(self, websocket: WebSocket, user_id: Optional[str] = None, 
+                      client_info: Optional[Dict[str, Any]] = None) -> str:
+        """Accept a new WebSocket connection"""
         await websocket.accept()
         
         connection_id = str(uuid.uuid4())
         self.active_connections[connection_id] = websocket
         
+        # Store connection metadata
+        self.connection_metadata[connection_id] = {
+            "user_id": user_id,
+            "connected_at": datetime.now().isoformat(),
+            "client_info": client_info or {},
+            "subscribed_rooms": set()
+        }
+        
+        # Associate with user if provided
         if user_id:
             if user_id not in self.user_connections:
                 self.user_connections[user_id] = set()
             self.user_connections[user_id].add(connection_id)
         
-        logger.info(f"WebSocket connected: {connection_id} for user: {user_id}")
+        self.stats["total_connections"] += 1
+        
+        logger.info(f"WebSocket connected: {connection_id} (User: {user_id})")
         
         # Send connection confirmation
-        await self.send_personal_message({
+        await self.send_personal_message(connection_id, {
             "type": "connection_established",
             "connection_id": connection_id,
-            "timestamp": datetime.utcnow().isoformat()
-        }, connection_id)
+            "timestamp": datetime.now().isoformat()
+        })
         
         return connection_id
     
-    def disconnect(self, connection_id: str, user_id: str = None):
-        """Remove WebSocket connection"""
+    def disconnect(self, connection_id: str):
+        """Remove a WebSocket connection"""
         if connection_id in self.active_connections:
+            # Remove from all rooms
+            rooms_to_leave = list(self.connection_metadata.get(connection_id, {}).get("subscribed_rooms", set()))
+            for room in rooms_to_leave:
+                self.leave_room(connection_id, room)
+            
+            # Remove from user connections
+            user_id = self.connection_metadata.get(connection_id, {}).get("user_id")
+            if user_id and user_id in self.user_connections:
+                self.user_connections[user_id].discard(connection_id)
+                if not self.user_connections[user_id]:
+                    del self.user_connections[user_id]
+            
+            # Clean up
             del self.active_connections[connection_id]
-        
-        if user_id and user_id in self.user_connections:
-            self.user_connections[user_id].discard(connection_id)
-            if not self.user_connections[user_id]:
-                del self.user_connections[user_id]
-        
-        # Remove from all subscriptions
-        for task_id in list(self.task_subscriptions.keys()):
-            self.task_subscriptions[task_id].discard(connection_id)
-            if not self.task_subscriptions[task_id]:
-                del self.task_subscriptions[task_id]
-        
-        for workflow_id in list(self.workflow_subscriptions.keys()):
-            self.workflow_subscriptions[workflow_id].discard(connection_id)
-            if not self.workflow_subscriptions[workflow_id]:
-                del self.workflow_subscriptions[workflow_id]
-        
-        logger.info(f"WebSocket disconnected: {connection_id}")
+            if connection_id in self.connection_metadata:
+                del self.connection_metadata[connection_id]
+            
+            logger.info(f"WebSocket disconnected: {connection_id}")
     
-    async def send_personal_message(self, message: Dict[str, Any], connection_id: str):
+    async def send_personal_message(self, connection_id: str, message: Dict[str, Any]):
         """Send message to specific connection"""
         if connection_id in self.active_connections:
             try:
                 websocket = self.active_connections[connection_id]
                 await websocket.send_text(json.dumps(message))
+                self.stats["messages_sent"] += 1
             except Exception as e:
-                logger.error(f"Failed to send message to {connection_id}: {e}")
-                # Remove dead connection
+                logger.error(f"Failed to send message to {connection_id}: {str(e)}")
+                self.stats["connection_errors"] += 1
+                # Remove broken connection
                 self.disconnect(connection_id)
     
-    async def send_to_user(self, message: Dict[str, Any], user_id: str):
-        """Send message to all connections of a user"""
+    async def send_to_user(self, user_id: str, message: Dict[str, Any]):
+        """Send message to all connections of a specific user"""
         if user_id in self.user_connections:
-            connection_ids = list(self.user_connections[user_id])
-            for connection_id in connection_ids:
-                await self.send_personal_message(message, connection_id)
+            tasks = []
+            for connection_id in self.user_connections[user_id].copy():
+                tasks.append(self.send_personal_message(connection_id, message))
+            
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
     
-    async def subscribe_to_task(self, connection_id: str, task_id: str):
-        """Subscribe connection to task updates"""
-        if task_id not in self.task_subscriptions:
-            self.task_subscriptions[task_id] = set()
-        self.task_subscriptions[task_id].add(connection_id)
+    def join_room(self, connection_id: str, room_name: str):
+        """Add connection to a room"""
+        if connection_id not in self.active_connections:
+            return False
         
-        # Subscribe to Redis channel for this task
-        channel = f"task_updates:{task_id}"
-        await self.pubsub.subscribe(channel)
+        # Create room if it doesn't exist
+        if room_name not in self.room_subscriptions:
+            self.room_subscriptions[room_name] = set()
+            self.message_history[room_name] = []
+            self.stats["rooms_created"] += 1
         
-        logger.info(f"Connection {connection_id} subscribed to task {task_id}")
+        # Add connection to room
+        self.room_subscriptions[room_name].add(connection_id)
+        
+        # Update connection metadata
+        if connection_id in self.connection_metadata:
+            self.connection_metadata[connection_id]["subscribed_rooms"].add(room_name)
+        
+        logger.info(f"Connection {connection_id} joined room {room_name}")
+        return True
     
-    async def subscribe_to_workflow(self, connection_id: str, workflow_id: str):
-        """Subscribe connection to workflow updates"""
-        if workflow_id not in self.workflow_subscriptions:
-            self.workflow_subscriptions[workflow_id] = set()
-        self.workflow_subscriptions[workflow_id].add(connection_id)
+    def leave_room(self, connection_id: str, room_name: str):
+        """Remove connection from a room"""
+        if room_name in self.room_subscriptions:
+            self.room_subscriptions[room_name].discard(connection_id)
+            
+            # Clean up empty rooms
+            if not self.room_subscriptions[room_name]:
+                del self.room_subscriptions[room_name]
+                if room_name in self.message_history:
+                    del self.message_history[room_name]
         
-        # Subscribe to Redis channel for this workflow
-        channel = f"workflow_updates:{workflow_id}"
-        await self.pubsub.subscribe(channel)
+        # Update connection metadata
+        if connection_id in self.connection_metadata:
+            self.connection_metadata[connection_id]["subscribed_rooms"].discard(room_name)
         
-        logger.info(f"Connection {connection_id} subscribed to workflow {workflow_id}")
+        logger.info(f"Connection {connection_id} left room {room_name}")
     
-    async def unsubscribe_from_task(self, connection_id: str, task_id: str):
-        """Unsubscribe connection from task updates"""
-        if task_id in self.task_subscriptions:
-            self.task_subscriptions[task_id].discard(connection_id)
-            if not self.task_subscriptions[task_id]:
-                del self.task_subscriptions[task_id]
-                # Unsubscribe from Redis channel
-                channel = f"task_updates:{task_id}"
-                await self.pubsub.unsubscribe(channel)
-    
-    async def broadcast_task_update(self, task_id: str, update: Dict[str, Any]):
-        """Broadcast task update to subscribed connections"""
-        message = {
-            "type": "task_update",
-            "task_id": task_id,
-            "data": update,
-            "timestamp": datetime.utcnow().isoformat()
+    async def broadcast_to_room(self, room_name: str, message: Dict[str, Any], 
+                               exclude_connections: Optional[Set[str]] = None,
+                               store_in_history: bool = True):
+        """Broadcast message to all connections in a room"""
+        if room_name not in self.room_subscriptions:
+            logger.warning(f"Attempted to broadcast to non-existent room: {room_name}")
+            return
+        
+        # Add timestamp and room info
+        message_with_metadata = {
+            **message,
+            "room": room_name,
+            "timestamp": datetime.now().isoformat()
         }
         
-        # Send via Redis pub/sub for scalability
-        channel = f"task_updates:{task_id}"
-        await self.redis_client.publish(channel, json.dumps(message))
+        # Store in history
+        if store_in_history:
+            self.message_history[room_name].append(message_with_metadata)
+            # Keep only last 100 messages per room
+            if len(self.message_history[room_name]) > 100:
+                self.message_history[room_name] = self.message_history[room_name][-100:]
         
-        # Also send directly to local connections
-        if task_id in self.task_subscriptions:
-            connection_ids = list(self.task_subscriptions[task_id])
-            for connection_id in connection_ids:
-                await self.send_personal_message(message, connection_id)
+        # Send to all subscribers
+        exclude_connections = exclude_connections or set()
+        connections_to_notify = self.room_subscriptions[room_name] - exclude_connections
+        
+        if connections_to_notify:
+            tasks = []
+            for connection_id in connections_to_notify.copy():
+                tasks.append(self.send_personal_message(connection_id, message_with_metadata))
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"Broadcasted to {len(connections_to_notify)} connections in room {room_name}")
     
-    async def broadcast_workflow_update(self, workflow_id: str, update: Dict[str, Any]):
-        """Broadcast workflow update to subscribed connections"""
-        message = {
-            "type": "workflow_update",
-            "workflow_id": workflow_id,
-            "data": update,
-            "timestamp": datetime.utcnow().isoformat()
+    async def broadcast_to_all(self, message: Dict[str, Any], 
+                              exclude_connections: Optional[Set[str]] = None):
+        """Broadcast message to all active connections"""
+        exclude_connections = exclude_connections or set()
+        connections_to_notify = set(self.active_connections.keys()) - exclude_connections
+        
+        message_with_metadata = {
+            **message,
+            "broadcast": True,
+            "timestamp": datetime.now().isoformat()
         }
         
-        # Send via Redis pub/sub
-        channel = f"workflow_updates:{workflow_id}"
-        await self.redis_client.publish(channel, json.dumps(message))
-        
-        # Send to local connections
-        if workflow_id in self.workflow_subscriptions:
-            connection_ids = list(self.workflow_subscriptions[workflow_id])
-            for connection_id in connection_ids:
-                await self.send_personal_message(message, connection_id)
+        if connections_to_notify:
+            tasks = []
+            for connection_id in connections_to_notify:
+                tasks.append(self.send_personal_message(connection_id, message_with_metadata))
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"Broadcasted to {len(connections_to_notify)} connections")
     
-    async def broadcast_system_notification(self, notification: Dict[str, Any], target_users: List[str] = None):
-        """Broadcast system notification"""
-        message = {
-            "type": "system_notification",
-            "data": notification,
-            "timestamp": datetime.utcnow().isoformat()
+    async def send_room_history(self, connection_id: str, room_name: str, limit: int = 50):
+        """Send recent message history for a room to a connection"""
+        if room_name in self.message_history:
+            history = self.message_history[room_name][-limit:]
+            await self.send_personal_message(connection_id, {
+                "type": "room_history",
+                "room": room_name,
+                "messages": history,
+                "count": len(history)
+            })
+    
+    def get_room_info(self, room_name: str) -> Optional[Dict[str, Any]]:
+        """Get information about a room"""
+        if room_name not in self.room_subscriptions:
+            return None
+        
+        connection_ids = self.room_subscriptions[room_name]
+        users = set()
+        
+        for conn_id in connection_ids:
+            if conn_id in self.connection_metadata:
+                user_id = self.connection_metadata[conn_id].get("user_id")
+                if user_id:
+                    users.add(user_id)
+        
+        return {
+            "room_name": room_name,
+            "connection_count": len(connection_ids),
+            "unique_users": len(users),
+            "message_history_count": len(self.message_history.get(room_name, []))
         }
+    
+    def get_connection_info(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        """Get information about a specific connection"""
+        if connection_id not in self.connection_metadata:
+            return None
         
-        if target_users:
-            # Send to specific users
-            for user_id in target_users:
-                await self.send_to_user(message, user_id)
-        else:
-            # Broadcast to all connections
-            for connection_id in list(self.active_connections.keys()):
-                await self.send_personal_message(message, connection_id)
+        metadata = self.connection_metadata[connection_id].copy()
+        metadata["subscribed_rooms"] = list(metadata.get("subscribed_rooms", set()))
+        metadata["is_active"] = connection_id in self.active_connections
+        
+        return metadata
     
-    async def _redis_subscriber(self):
-        """Background task to handle Redis pub/sub messages"""
-        try:
-            async for message in self.pubsub.listen():
-                if message['type'] == 'message':
-                    try:
-                        data = json.loads(message['data'])
-                        channel = message['channel'].decode('utf-8')
-                        
-                        # Route message based on channel pattern
-                        if channel.startswith('task_updates:'):
-                            task_id = channel.replace('task_updates:', '')
-                            await self._handle_task_update(task_id, data)
-                        elif channel.startswith('workflow_updates:'):
-                            workflow_id = channel.replace('workflow_updates:', '')
-                            await self._handle_workflow_update(workflow_id, data)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing Redis message: {e}")
-        except Exception as e:
-            logger.error(f"Redis subscriber error: {e}")
+    def get_stats(self) -> Dict[str, Any]:
+        """Get connection manager statistics"""
+        active_rooms = len(self.room_subscriptions)
+        total_room_connections = sum(len(conns) for conns in self.room_subscriptions.values())
+        
+        return {
+            **self.stats,
+            "active_connections": len(self.active_connections),
+            "active_rooms": active_rooms,
+            "unique_users": len(self.user_connections),
+            "total_room_connections": total_room_connections,
+            "average_connections_per_room": total_room_connections / active_rooms if active_rooms > 0 else 0
+        }
     
-    async def _handle_task_update(self, task_id: str, data: Dict[str, Any]):
-        """Handle task update from Redis"""
-        if task_id in self.task_subscriptions:
-            connection_ids = list(self.task_subscriptions[task_id])
-            for connection_id in connection_ids:
-                await self.send_personal_message(data, connection_id)
-    
-    async def _handle_workflow_update(self, workflow_id: str, data: Dict[str, Any]):
-        """Handle workflow update from Redis"""
-        if workflow_id in self.workflow_subscriptions:
-            connection_ids = list(self.workflow_subscriptions[workflow_id])
-            for connection_id in connection_ids:
-                await self.send_personal_message(data, connection_id)
+    async def cleanup_stale_connections(self):
+        """Remove connections that are no longer active"""
+        stale_connections = []
+        
+        for connection_id, websocket in self.active_connections.items():
+            try:
+                # Try to ping the connection
+                await websocket.ping()
+            except Exception:
+                stale_connections.append(connection_id)
+        
+        for connection_id in stale_connections:
+            self.disconnect(connection_id)
+        
+        if stale_connections:
+            logger.info(f"Cleaned up {len(stale_connections)} stale connections")
+        
+        return len(stale_connections)
 
+
+# WebSocket endpoint handlers
+async def websocket_endpoint(websocket: WebSocket, connection_manager: ConnectionManager):
+    """Main WebSocket endpoint handler"""
+    connection_id = None
+    
+    try:
+        # Extract user info from query parameters or headers
+        user_id = websocket.query_params.get("user_id")
+        client_info = {
+            "user_agent": websocket.headers.get("user-agent", ""),
+            "origin": websocket.headers.get("origin", "")
+        }
+        
+        connection_id = await connection_manager.connect(websocket, user_id, client_info)
+        
+        while True:
+            # Receive message from client
+            data = await websocket.receive_text()
+            
+            try:
+                message = json.loads(data)
+                await handle_client_message(connection_id, message, connection_manager)
+            except json.JSONDecodeError:
+                await connection_manager.send_personal_message(connection_id, {
+                    "type": "error",
+                    "message": "Invalid JSON format"
+                })
+            except Exception as e:
+                logger.error(f"Error handling client message: {str(e)}")
+                await connection_manager.send_personal_message(connection_id, {
+                    "type": "error", 
+                    "message": "Message processing failed"
+                })
+    
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+    finally:
+        if connection_id:
+            connection_manager.disconnect(connection_id)
+
+async def handle_client_message(connection_id: str, message: Dict[str, Any], 
+                               connection_manager: ConnectionManager):
+    """Handle messages from WebSocket clients"""
+    message_type = message.get("type")
+    
+    if message_type == "join_room":
+        room_name = message.get("room")
+        if room_name:
+            success = connection_manager.join_room(connection_id, room_name)
+            if success:
+                # Send room history
+                await connection_manager.send_room_history(connection_id, room_name)
+                
+                # Notify room about new member
+                await connection_manager.broadcast_to_room(room_name, {
+                    "type": "member_joined",
+                    "connection_id": connection_id
+                }, exclude_connections={connection_id})
+    
+    elif message_type == "leave_room":
+        room_name = message.get("room")
+        if room_name:
+            connection_manager.leave_room(connection_id, room_name)
+            
+            # Notify room about member leaving
+            await connection_manager.broadcast_to_room(room_name, {
+                "type": "member_left",
+                "connection_id": connection_id
+            })
+    
+    elif message_type == "room_message":
+        room_name = message.get("room")
+        content = message.get("content")
+        if room_name and content:
+            await connection_manager.broadcast_to_room(room_name, {
+                "type": "room_message",
+                "from": connection_id,
+                "content": content
+            })
+    
+    elif message_type == "get_room_info":
+        room_name = message.get("room")
+        if room_name:
+            room_info = connection_manager.get_room_info(room_name)
+            await connection_manager.send_personal_message(connection_id, {
+                "type": "room_info",
+                "room_info": room_info
+            })
+    
+    elif message_type == "ping":
+        await connection_manager.send_personal_message(connection_id, {
+            "type": "pong",
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    else:
+        await connection_manager.send_personal_message(connection_id, {
+            "type": "error",
+            "message": f"Unknown message type: {message_type}"
+        })
+
+
+# Analysis progress tracking
+class AnalysisProgressTracker:
+    """Track and broadcast analysis progress"""
+    
+    def __init__(self, connection_manager: ConnectionManager):
+        self.connection_manager = connection_manager
+        self.active_analyses: Dict[str, Dict[str, Any]] = {}
+    
+    async def start_analysis(self, analysis_id: str, analysis_type: str, user_id: Optional[str] = None):
+        """Start tracking an analysis"""
+        self.active_analyses[analysis_id] = {
+            "type": analysis_type,
+            "user_id": user_id,
+            "started_at": datetime.now().isoformat(),
+            "progress": 0,
+            "status": "starting",
+            "steps": []
+        }
+        
+        await self.connection_manager.broadcast_to_room("analysis_updates", {
+            "type": "analysis_started",
+            "analysis_id": analysis_id,
+            "analysis_type": analysis_type,
+            "user_id": user_id
+        })
+        
+        if user_id:
+            await self.connection_manager.send_to_user(user_id, {
+                "type": "personal_analysis_started",
+                "analysis_id": analysis_id,
+                "analysis_type": analysis_type
+            })
+    
+    async def update_progress(self, analysis_id: str, progress: int, status: str, 
+                            step_info: Optional[Dict[str, Any]] = None):
+        """Update analysis progress"""
+        if analysis_id in self.active_analyses:
+            analysis = self.active_analyses[analysis_id]
+            analysis["progress"] = progress
+            analysis["status"] = status
+            analysis["last_updated"] = datetime.now().isoformat()
+            
+            if step_info:
+                analysis["steps"].append({
+                    **step_info,
+                    "timestamp": datetime.now().isoformat()
+                })
+            
+            # Broadcast update
+            await self.connection_manager.broadcast_to_room("analysis_updates", {
+                "type": "analysis_progress",
+                "analysis_id": analysis_id,
+                "progress": progress,
+                "status": status,
+                "step_info": step_info
+            })
+            
+            # Send to specific user
+            user_id = analysis.get("user_id")
+            if user_id:
+                await self.connection_manager.send_to_user(user_id, {
+                    "type": "personal_analysis_progress",
+                    "analysis_id": analysis_id,
+                    "progress": progress,
+                    "status": status
+                })
+    
+    async def complete_analysis(self, analysis_id: str, results: Dict[str, Any]):
+        """Mark analysis as completed"""
+        if analysis_id in self.active_analyses:
+            analysis = self.active_analyses[analysis_id]
+            analysis["status"] = "completed"
+            analysis["completed_at"] = datetime.now().isoformat()
+            analysis["results"] = results
+            
+            await self.connection_manager.broadcast_to_room("analysis_updates", {
+                "type": "analysis_completed", 
+                "analysis_id": analysis_id,
+                "results": results
+            })
+            
+            user_id = analysis.get("user_id")
+            if user_id:
+                await self.connection_manager.send_to_user(user_id, {
+                    "type": "personal_analysis_completed",
+                    "analysis_id": analysis_id,
+                    "results": results
+                })
+    
+    async def fail_analysis(self, analysis_id: str, error: str):
+        """Mark analysis as failed"""
+        if analysis_id in self.active_analyses:
+            analysis = self.active_analyses[analysis_id]
+            analysis["status"] = "failed"
+            analysis["failed_at"] = datetime.now().isoformat()
+            analysis["error"] = error
+            
+            await self.connection_manager.broadcast_to_room("analysis_updates", {
+                "type": "analysis_failed",
+                "analysis_id": analysis_id,
+                "error": error
+            })
+            
+            user_id = analysis.get("user_id")
+            if user_id:
+                await self.connection_manager.send_to_user(user_id, {
+                    "type": "personal_analysis_failed",
+                    "analysis_id": analysis_id,
+                    "error": error
+                })
+    
+    def get_analysis_status(self, analysis_id: str) -> Optional[Dict[str, Any]]:
+        """Get current status of an analysis"""
+        return self.active_analyses.get(analysis_id)

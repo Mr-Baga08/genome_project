@@ -23,4 +23,4 @@ COPY . .
 RUN mkdir -p /app/uploads /tmp/ugene_workdir
 
 # Start RQ worker
-CMD ["python", "-m", "app.worker"]
+CMD ["celery", "-A", "app.worker.app worker", "--loglevel=info"]
