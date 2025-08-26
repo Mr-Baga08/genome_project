@@ -1,142 +1,153 @@
-# docker-compose.yml
-version: '3.8'
-
+# docker-compose.yml - Fixed version
 services:
-  # MongoDB Database
-  mongodb:
-    image: mongo:6.0
-    container_name: ugene_mongodb
-    restart: always
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-admin}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-password123}
-      MONGO_INITDB_DATABASE: ${MONGO_DB:-ugene_workflows}
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-      - ./mongo-init-scripts:/docker-entrypoint-initdb.d
-    networks:
-      - ugene_network
-
-  # Redis Queue
-  redis:
-    image: redis:7-alpine
-    container_name: ugene_redis
-    restart: always
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - ugene_network
-
-  # UGENE SDK Docker Image
-  ugene_sdk:
-    build:
-      context: ./ugene-sdk
-      dockerfile: Dockerfile
-    image: ugene_sdk_docker_image
-    container_name: ugene_sdk_container
-    volumes:
-      - ugene_workdir:/tmp/ugene_workdir
-      - ./data:/data
-    networks:
-      - ugene_network
-
-  # FastAPI Backend
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: ugene_backend
-    restart: always
-    ports:
-      - "8000:8000"
-    environment:
-      - ENVIRONMENT=${ENVIRONMENT:-production}
-      - MONGODB_URL=mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-password123}@mongodb:27017
-      - REDIS_URL=redis://redis:6379
-      - DATABASE_NAME=${MONGO_DB:-ugene_workflows}
-      - UPLOAD_DIR=/app/uploads
-      - UGENE_WORKDIR=/tmp/ugene_workdir
-    volumes:
-      - ./backend:/app
-      - ugene_workdir:/tmp/ugene_workdir
-      - upload_storage:/app/uploads
-      - ./data:/app/data
-    depends_on:
-      - mongodb
-      - redis
-      - ugene_sdk
-    networks:
-      - ugene_network
-
-  # RQ Worker for Background Tasks
-  worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.worker
-    container_name: ugene_worker
-    restart: always
-    environment:
-      - ENVIRONMENT=${ENVIRONMENT:-production}
-      - MONGODB_URL=mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-password123}@mongodb:27017
-      - REDIS_URL=redis://redis:6379
-      - DATABASE_NAME=${MONGO_DB:-ugene_workflows}
-      - UGENE_WORKDIR=/tmp/ugene_workdir
-    volumes:
-      - ./backend:/app
-      - ugene_workdir:/tmp/ugene_workdir
-      - upload_storage:/app/uploads
-      - ./data:/app/data
-    depends_on:
-      - mongodb
-      - redis
-      - ugene_sdk
-    networks:
-      - ugene_network
-
-  # React Frontend
+  # Frontend React Application
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        - REACT_APP_API_URL=http://localhost:8000
+      target: development
     container_name: ugene_frontend
-    restart: always
     ports:
-      - "3000:80"
-    depends_on:
-      - backend
-    networks:
-      - ugene_network
-
-  # Nginx Reverse Proxy (Optional)
-  nginx:
-    image: nginx:alpine
-    container_name: ugene_nginx
-    restart: always
-    ports:
-      - "80:80"
-      - "443:443"
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000/ws
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-      - ./nginx/ssl:/etc/nginx/ssl
-    depends_on:
-      - frontend
-      - backend
+      - ./frontend:/app
+      - /app/node_modules
     networks:
-      - ugene_network
+      - ugene-network
+    restart: unless-stopped
+    depends_on:
+      - backend
 
+  # Backend FastAPI Application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: ugene_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=debug
+      - RELOAD=true
+      - MONGODB_URL=mongodb://mongodb:27017
+      - DATABASE_NAME=ugene_bioinformatics
+      - REDIS_URL=redis://redis:6379/0
+      - INIT_DATABASE=true
+      - ENABLE_METRICS=false
+      - SERVE_STATIC=false
+      - ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8080
+      - ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0,backend
+      - CELERY_BROKER=redis://redis:6379/1
+      - CELERY_BACKEND=redis://redis:6379/1
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+      - analysis_data:/app/data
+      - upload_storage:/app/uploads
+      - logs_data:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - ugene-network
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+      - redis
+
+  # Celery Worker for Background Tasks (Single instance for development)
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: ugene_worker
+    environment:
+      - ENVIRONMENT=development
+      - MONGODB_URL=mongodb://mongodb:27017
+      - DATABASE_NAME=ugene_bioinformatics
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER=redis://redis:6379/1
+      - CELERY_BACKEND=redis://redis:6379/1
+      - WORKER_CONCURRENCY=2
+      - WORKER_MAX_TASKS_PER_CHILD=1000
+      - LOG_LEVEL=debug
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+      - analysis_data:/app/data
+      - upload_storage:/app/uploads
+      - logs_data:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - ugene-network
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+      - redis
+      - backend
+    command: ["python", "-m", "celery", "-A", "app.worker", "worker", "--loglevel=debug", "--concurrency=2"]
+
+  # MongoDB Database
+  mongodb:
+    image: mongo:7.0
+    container_name: ugene_mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=ugene_bioinformatics
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    networks:
+      - ugene-network
+    restart: unless-stopped
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/ugene_bioinformatics --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache and Message Broker
+  redis:
+    image: redis:7.2-alpine
+    container_name: ugene_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - ugene-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Network Configuration
+networks:
+  ugene-network:
+    driver: bridge
+
+# Volume Configuration  
 volumes:
   mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
   redis_data:
-  ugene_workdir:
+    driver: local
+  analysis_data:
+    driver: local
   upload_storage:
-
-networks:
-  ugene_network:
-    driver: bridge
+    driver: local
+  logs_data:
+    driver: local
 

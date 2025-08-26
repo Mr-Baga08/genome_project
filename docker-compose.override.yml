@@ -1,14 +1,31 @@
-version: '3.8'
+---
 
+# docker-compose.override.yml - Development overrides (fixed)
 services:
+  # Development-specific overrides
   backend:
-    # Re-introduce the volume mount for live code changes
+    environment:
+      - ENVIRONMENT=development
+      - RELOAD=true
+      - LOG_LEVEL=debug
+      - INIT_DATABASE=true
     volumes:
       - ./backend:/app
-    # Override the CMD to re-enable --reload for development
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - /app/__pycache__
+
+  frontend:
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000/ws
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
 
   worker:
-    # Re-introduce the volume mount so the worker also sees code changes
+    environment:
+      - LOG_LEVEL=debug
     volumes:
       - ./backend:/app
+      - /app/__pycache__
+
+

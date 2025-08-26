@@ -1,37 +1,53 @@
 # frontend/Dockerfile
-# Build stage
-FROM node:18-alpine as build
+FROM node:18-alpine AS base
 
+# Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
-
 # Install dependencies
-RUN npm install --legacy-peer-deps
+COPY package*.json ./
+RUN npm install --only=production && npm cache clean --force
+
+# Development stage
+FROM base AS development
+# Install all dependencies including dev dependencies
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Expose port
+EXPOSE 3000
+
+# Start development server
+CMD ["npm", "start"]
+
+# Build stage
+FROM base AS build
+# Install all dependencies for building
+RUN npm ci
+
 # Copy source code
 COPY . .
 
 # Build the application
-ARG REACT_APP_API_URL=http://localhost:8000
-ENV REACT_APP_API_URL=$REACT_APP_API_URL
-
 RUN npm run build
 
-# Start in development mode instead of building
-EXPOSE 3000
-CMD ["npm", "start"]
+# Production stage
+FROM nginx:alpine AS production
 
-# # Production stage
-# FROM nginx:alpine
+# Copy built app from build stage
+COPY --from=build /app/build /usr/share/nginx/html
 
-# # Copy built application
-# COPY --from=build /app/build /usr/share/nginx/html
+# Copy nginx configuration
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# # Copy nginx configuration
-# COPY nginx.conf /etc/nginx/nginx.conf
+# Expose port
+EXPOSE 80
 
-# # Expose port 80
-# EXPOSE 80
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost || exit 1
 
-# CMD ["nginx", "-g", "daemon off;"]
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]

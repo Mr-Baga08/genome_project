@@ -1,0 +1,79 @@
+
+# docker-compose.prod.yml - Production configuration (separate file)
+services:
+  # Frontend with production build
+  frontend:
+    build:
+      target: production
+    ports:
+      - "80:80"
+    volumes: []  # No development volumes
+
+  # Backend with production settings
+  backend:
+    build:
+      target: production
+    environment:
+      - ENVIRONMENT=production
+      - RELOAD=false
+      - LOG_LEVEL=info
+      - WORKERS=4
+      - ENABLE_METRICS=true
+    volumes:
+      - analysis_data:/app/data
+      - upload_storage:/app/uploads
+      - logs_data:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Multiple workers for production (no fixed container names)
+  worker:
+    build:
+      target: production
+    # Remove container_name for scaling
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - WORKER_CONCURRENCY=4
+    volumes:
+      - analysis_data:/app/data
+      - upload_storage:/app/uploads
+      - logs_data:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # Production MongoDB with authentication
+  mongodb:
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-ugeneadmin}
+    command: --auth
+
+  # Production Redis with persistence
+  redis:
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-ugene123}
+
+  # Nginx reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    container_name: ugene_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - logs_data:/var/log/nginx
+    networks:
+      - ugene-network
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend

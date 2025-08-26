@@ -1,4 +1,3 @@
-# monitoring/prometheus.yml - Prometheus Configuration
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -6,50 +5,32 @@ global:
 rule_files:
   - "rules/*.yml"
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets:
-          - alertmanager:9093
-
 scrape_configs:
-  # API Gateway metrics
-  - job_name: 'api-gateway'
+  - job_name: 'ugene-backend'
     static_configs:
-      - targets: ['api-gateway:8000']
+      - targets: ['backend:8000']
     metrics_path: '/metrics'
     scrape_interval: 30s
-
-  # Microservices metrics
-  - job_name: 'sequence-service'
-    static_configs:
-      - targets: ['sequence-service:8001']
-    metrics_path: '/metrics'
-
-  - job_name: 'analysis-service'
-    static_configs:
-      - targets: ['analysis-service:8002']
-    metrics_path: '/metrics'
-
-  - job_name: 'workflow-service'
-    static_configs:
-      - targets: ['workflow-service:8003']
-    metrics_path: '/metrics'
-
-  # Infrastructure metrics
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['postgres-exporter:9187']
-
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis-exporter:9121']
+    scrape_timeout: 10s
 
   - job_name: 'nginx'
     static_configs:
-      - targets: ['nginx-exporter:9113']
+      - targets: ['nginx:80']
+    metrics_path: '/metrics'
 
-  # Node exporter for system metrics
-  - job_name: 'node-exporter'
+  - job_name: 'redis'
     static_configs:
-      - targets: ['node-exporter:9100']
+      - targets: ['redis:6379']
+    
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['mongodb:27017']
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
